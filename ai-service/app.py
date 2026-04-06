@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder
 import requests
 import faiss
 import numpy as np
@@ -21,6 +22,7 @@ app = FastAPI()
 
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 OLLAMA_URL = "http://localhost:11434/api/generate"
+reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 dimension = 384
 index = faiss.IndexFlatL2(dimension)
@@ -125,6 +127,46 @@ def retrieval_agent(query: str, k=3):
     logger.info(f"[Retrieval] Retrieved {len(retrieved_docs)} docs")
 
     return retrieved_docs
+
+def reranking_agent(query: str, docs: list[str], top_k=3, score_threshold=0.5):
+    logger.info(f"[Re-Ranker] Input docs: {len(docs)}")
+
+    if not docs:
+        logger.warning("[Re-Ranker] No docs to rank")
+        return []
+
+    # Create (query, doc) pairs
+    pairs = [(query, doc) for doc in docs]
+
+    # Predict scores
+    scores = reranker_model.predict(pairs)
+
+    # Attach scores
+    scored_docs = list(zip(docs, scores))
+
+    # Log all scores (important for tuning)
+    for doc, score in scored_docs:
+        logger.info(f"[Re-Ranker] Score: {score:.4f} | Doc: {doc[:80]}")
+
+    # Filter by threshold
+    filtered_docs = [(doc, score) for doc, score in scored_docs if score >= score_threshold]
+
+    logger.info(f"[Re-Ranker] After threshold ({score_threshold}): {len(filtered_docs)} docs")
+
+    # If nothing passes threshold → fallback to original
+    if not filtered_docs:
+        logger.warning("[Re-Ranker] No docs passed threshold → using top scored docs")
+        filtered_docs = scored_docs
+
+    # Sort descending
+    ranked_docs = sorted(filtered_docs, key=lambda x: x[1], reverse=True)
+
+    # Pick top_k
+    top_docs = [doc for doc, _ in ranked_docs[:top_k]]
+
+    logger.info(f"[Re-Ranker] Final selected docs: {len(top_docs)}")
+
+    return top_docs
 
 
 def validation_agent(docs: list[str]):
@@ -242,34 +284,44 @@ def ask(req: AskRequest):
 
     logger.info(f"[ASK] Query: {req.query}")
 
-    # Step 1: Normal retrieval
-    docs = retrieval_agent(req.query)
+    # Step 1: High recall retrieval
+    docs = retrieval_agent(req.query, k=10)
 
-    # Step 2: Multi-query retry
+    # Step 2: If no docs → multi-query
     if not validation_agent(docs):
         logger.warning("[ASK] No docs found → Multi-query triggered")
 
         queries = multi_query_agent(req.query)
-        docs = multi_retrieval_agent(queries)
+
+        # Retrieve more from multiple queries
+        docs = multi_retrieval_agent(queries, k=5)
 
         if not docs:
             logger.error("[ASK] No docs found even after multi-query")
-
             return {
                 "answer": "I don't know based on available data.",
                 "sources": []
             }
+
+        #Re-rank after multi-query
+        docs = reranking_agent(req.query, docs, top_k=3)
+
+        logger.info(f"[ASK] Final docs after re-ranking (multi-query): {len(docs)}")
 
         answer = generation_agent(req.query, docs)
 
         return {
             "answer": answer,
             "sources": docs,
-            "note": "answered using multi-query retrieval"
+            "note": "answered using multi-query + reranking"
         }
 
-    # Step 3: Normal flow
-    logger.info("[ASK] Using normal retrieval")
+    # Step 3: Normal flow → apply re-ranking
+    logger.info("[ASK] Applying re-ranking on retrieved docs")
+
+    docs = reranking_agent(req.query, docs, top_k=3)
+
+    logger.info(f"[ASK] Final docs after re-ranking: {len(docs)}")
 
     answer = generation_agent(req.query, docs)
 
