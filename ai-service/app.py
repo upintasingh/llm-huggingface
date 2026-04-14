@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-from sentence_transformers import CrossEncoder
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import requests
 import faiss
 import numpy as np
@@ -21,8 +20,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-OLLAMA_URL = "http://localhost:11434/api/generate"
 reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
 
 dimension = 384
 index = faiss.IndexFlatL2(dimension)
@@ -50,25 +50,31 @@ class AskRequest(BaseModel):
 
 @app.post("/embed")
 def embed(req: TextRequest):
-    logger.info(f"[EMBED] Text received")
+    logger.info("[EMBED] Text received")
     vector = embedding_model.encode(req.text).tolist()
     return {"embedding": vector}
 
 
 @app.post("/generate")
 def generate(req: PromptRequest):
-    logger.info(f"[LLM] Generating response")
+    logger.info("[LLM] Generating response")
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": "llama3",
-            "prompt": req.prompt,
-            "stream": False
-        }
-    )
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": "llama3",
+                "prompt": req.prompt,
+                "stream": False
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
 
-    return response.json()
+    except Exception as e:
+        logger.error(f"[LLM] Error: {str(e)}")
+        return {"error": str(e)}
 
 
 @app.post("/store")
@@ -80,8 +86,9 @@ def store(req: StoreRequest):
         return {"message": "No texts provided"}
 
     vectors = embedding_model.encode(req.texts)
+    vectors = np.array(vectors).astype("float32")
 
-    index.add(np.array(vectors).astype("float32"))
+    index.add(vectors)
     documents.extend(req.texts)
 
     logger.info(f"[STORE] Total documents: {len(documents)}")
@@ -98,7 +105,9 @@ def search(req: SearchRequest):
         return {"results": []}
 
     query_vector = embedding_model.encode([req.query])
-    D, I = index.search(np.array(query_vector).astype("float32"), k=3)
+    query_vector = np.array(query_vector).astype("float32")
+
+    D, I = index.search(query_vector, k=3)
 
     results = [documents[i] for i in I[0] if 0 <= i < len(documents)]
 
@@ -116,17 +125,16 @@ def retrieval_agent(query: str, k=3):
         return []
 
     query_vector = embedding_model.encode([query])
-    D, I = index.search(np.array(query_vector).astype("float32"), k=k)
+    query_vector = np.array(query_vector).astype("float32")
 
-    retrieved_docs = []
+    D, I = index.search(query_vector, k=k)
 
-    for idx in I[0]:
-        if 0 <= idx < len(documents):
-            retrieved_docs.append(documents[idx])
+    retrieved_docs = [documents[i] for i in I[0] if 0 <= i < len(documents)]
 
     logger.info(f"[Retrieval] Retrieved {len(retrieved_docs)} docs")
 
     return retrieved_docs
+
 
 def reranking_agent(query: str, docs: list[str], top_k=3, score_threshold=0.5):
     logger.info(f"[Re-Ranker] Input docs: {len(docs)}")
@@ -135,38 +143,67 @@ def reranking_agent(query: str, docs: list[str], top_k=3, score_threshold=0.5):
         logger.warning("[Re-Ranker] No docs to rank")
         return []
 
-    # Create (query, doc) pairs
     pairs = [(query, doc) for doc in docs]
-
-    # Predict scores
     scores = reranker_model.predict(pairs)
 
-    # Attach scores
     scored_docs = list(zip(docs, scores))
 
-    # Log all scores (important for tuning)
     for doc, score in scored_docs:
         logger.info(f"[Re-Ranker] Score: {score:.4f} | Doc: {doc[:80]}")
 
-    # Filter by threshold
     filtered_docs = [(doc, score) for doc, score in scored_docs if score >= score_threshold]
 
     logger.info(f"[Re-Ranker] After threshold ({score_threshold}): {len(filtered_docs)} docs")
 
-    # If nothing passes threshold → fallback to original
     if not filtered_docs:
-        logger.warning("[Re-Ranker] No docs passed threshold → using top scored docs")
+        logger.warning("[Re-Ranker] No docs passed threshold → fallback to all")
         filtered_docs = scored_docs
 
-    # Sort descending
     ranked_docs = sorted(filtered_docs, key=lambda x: x[1], reverse=True)
 
-    # Pick top_k
     top_docs = [doc for doc, _ in ranked_docs[:top_k]]
 
     logger.info(f"[Re-Ranker] Final selected docs: {len(top_docs)}")
 
     return top_docs
+
+
+def compression_agent(query: str, docs: list[str], top_k=2, max_chars=300):
+    """
+    Query-aware compression using reranker.
+    Keeps only most relevant docs and trims them.
+    """
+
+    logger.info("[Compression] Query-aware compression started")
+
+    if not docs:
+        return []
+
+    # Step 1: Score docs again (fine filtering)
+    pairs = [(query, doc) for doc in docs]
+    scores = reranker_model.predict(pairs)
+
+    scored_docs = list(zip(docs, scores))
+
+    # Step 2: Sort by relevance
+    ranked_docs = sorted(scored_docs, key=lambda x: x[1], reverse=True)
+
+    # Step 3: Keep top_k most relevant docs
+    top_docs = [doc for doc, _ in ranked_docs[:top_k]]
+
+    logger.info(f"[Compression] Selected top {len(top_docs)} docs")
+
+    # Step 4: Trim for token safety
+    compressed_docs = []
+    for doc in top_docs:
+        if len(doc) > max_chars:
+            compressed_docs.append(doc[:max_chars] + "...")
+        else:
+            compressed_docs.append(doc)
+
+    logger.info(f"[Compression] Final compressed docs: {len(compressed_docs)}")
+
+    return compressed_docs
 
 
 def validation_agent(docs: list[str]):
@@ -182,10 +219,12 @@ def generation_agent(query: str, docs: list[str]):
     context = "\n".join(docs)
 
     prompt = f"""
-You are an AI assistant.
+You are a precise AI assistant.
 
-Use ONLY the context below.
-If answer not found, say "I don't know".
+Rules:
+- Use ONLY the provided context
+- If answer is not clearly present, say "I don't know"
+- Do NOT hallucinate
 
 Context:
 {context}
@@ -203,12 +242,19 @@ Answer:
                 "model": "llama3",
                 "prompt": prompt,
                 "stream": False
-            }
+            },
+            timeout=30
         )
+        response.raise_for_status()
 
-        answer = response.json().get("response")
+        data = response.json()
+        answer = data.get("response", "").strip()
+
+        if not answer:
+            logger.warning("[Generation] Empty response")
+            return "I don't know."
+
         logger.info("[Generation] Success")
-
         return answer
 
     except Exception as e:
@@ -233,10 +279,7 @@ def multi_query_agent(query: str):
     logger.info(f"[Multi-Query] Original: {query}")
 
     prompt = f"""
-You are an AI assistant.
-
-Generate 3 different rephrased versions of the user question
-to improve document retrieval.
+Generate 3 different rephrased versions of the user question.
 
 Original Question:
 {query}
@@ -250,13 +293,21 @@ Return only the questions as a list.
             "model": "llama3",
             "prompt": prompt,
             "stream": False
-        }
+        },
+        timeout=30
     )
 
     text = response.json().get("response", "")
 
-    queries = [q.strip("- ").strip() for q in text.split("\n") if q.strip()]
-    queries = list(set(queries))[:3]
+    queries = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        line = line.lstrip("-1234567890. ").strip()
+        queries.append(line)
+
+    queries = list(dict.fromkeys(queries))[:3]
 
     logger.info(f"[Multi-Query] Generated: {queries}")
 
@@ -270,8 +321,7 @@ def multi_retrieval_agent(queries: list[str], k=3):
 
     for q in queries:
         docs = retrieval_agent(q, k)
-        for d in docs:
-            all_docs.add(d)
+        all_docs.update(docs)
 
     logger.info(f"[Multi-Retrieval] Unique docs: {len(all_docs)}")
 
@@ -284,44 +334,35 @@ def ask(req: AskRequest):
 
     logger.info(f"[ASK] Query: {req.query}")
 
-    # Step 1: High recall retrieval
     docs = retrieval_agent(req.query, k=10)
 
-    # Step 2: If no docs → multi-query
     if not validation_agent(docs):
-        logger.warning("[ASK] No docs found → Multi-query triggered")
+        logger.warning("[ASK] No docs → Multi-query triggered")
 
         queries = multi_query_agent(req.query)
-
-        # Retrieve more from multiple queries
         docs = multi_retrieval_agent(queries, k=5)
 
         if not docs:
-            logger.error("[ASK] No docs found even after multi-query")
             return {
                 "answer": "I don't know based on available data.",
                 "sources": []
             }
 
-        #Re-rank after multi-query
         docs = reranking_agent(req.query, docs, top_k=3)
 
-        logger.info(f"[ASK] Final docs after re-ranking (multi-query): {len(docs)}")
+        docs = compression_agent(req.query, docs)
 
         answer = generation_agent(req.query, docs)
 
         return {
             "answer": answer,
             "sources": docs,
-            "note": "answered using multi-query + reranking"
+            "note": "multi-query + reranking + compression"
         }
-
-    # Step 3: Normal flow → apply re-ranking
-    logger.info("[ASK] Applying re-ranking on retrieved docs")
 
     docs = reranking_agent(req.query, docs, top_k=3)
 
-    logger.info(f"[ASK] Final docs after re-ranking: {len(docs)}")
+    docs = compression_agent(req.query, docs)
 
     answer = generation_agent(req.query, docs)
 
