@@ -1,10 +1,12 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer, CrossEncoder
+from rank_bm25 import BM25Okapi
 import requests
 import faiss
 import numpy as np
 import logging
+
 
 # ----------- Logging Setup -----------
 
@@ -28,6 +30,8 @@ dimension = 384
 index = faiss.IndexFlatL2(dimension)
 
 documents = []
+tokenized_corpus = []
+bm25 = None
 
 # ----------- Request Models -----------
 
@@ -79,6 +83,7 @@ def generate(req: PromptRequest):
 
 @app.post("/store")
 def store(req: StoreRequest):
+    global bm25, tokenized_corpus
     logger.info(f"[STORE] Incoming texts: {len(req.texts)}")
 
     if not req.texts:
@@ -90,6 +95,9 @@ def store(req: StoreRequest):
 
     index.add(vectors)
     documents.extend(req.texts)
+
+    tokenized_corpus = [doc.split() for doc in documents]
+    bm25 = BM25Okapi(tokenized_corpus)
 
     logger.info(f"[STORE] Total documents: {len(documents)}")
 
@@ -134,6 +142,61 @@ def retrieval_agent(query: str, k=3):
     logger.info(f"[Retrieval] Retrieved {len(retrieved_docs)} docs")
 
     return retrieved_docs
+
+def hybrid_retrieval_agent(query: str, k=5, alpha=0.5):
+    """
+    Hybrid = Vector (FAISS) + BM25
+    alpha → weight for vector vs keyword
+    """
+
+    logger.info("[Hybrid] Running hybrid retrieval")
+
+    if len(documents) == 0 or bm25 is None:
+        logger.warning("[Hybrid] No documents available")
+        return []
+
+    # -------- VECTOR SEARCH --------
+    query_vector = embedding_model.encode([query])
+    query_vector = np.array(query_vector).astype("float32")
+
+    D, I = index.search(query_vector, k=k)
+
+    vector_scores = {documents[i]: float(D[0][idx]) for idx, i in enumerate(I[0]) if i < len(documents)}
+
+    # -------- BM25 SEARCH --------
+    tokenized_query = query.split()
+    bm25_scores_raw = bm25.get_scores(tokenized_query)
+
+    # Normalize BM25 scores
+    bm25_scores = {}
+    max_bm25 = max(bm25_scores_raw) if len(bm25_scores_raw) > 0 else 1
+
+    for i, score in enumerate(bm25_scores_raw):
+        bm25_scores[documents[i]] = score / max_bm25 if max_bm25 != 0 else 0
+
+    # -------- COMBINE SCORES --------
+    combined_scores = {}
+
+    all_docs = set(vector_scores.keys()) | set(bm25_scores.keys())
+
+    for doc in all_docs:
+        v_score = vector_scores.get(doc, 0)
+        b_score = bm25_scores.get(doc, 0)
+
+        # NOTE: FAISS distance → lower is better → invert it
+        v_score = 1 / (1 + v_score)
+
+        combined_score = alpha * v_score + (1 - alpha) * b_score
+        combined_scores[doc] = combined_score
+
+    # -------- SORT --------
+    ranked_docs = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+
+    final_docs = [doc for doc, _ in ranked_docs[:k]]
+
+    logger.info(f"[Hybrid] Final docs: {len(final_docs)}")
+
+    return final_docs
 
 
 def reranking_agent(query: str, docs: list[str], top_k=3, score_threshold=0.5):
@@ -320,7 +383,7 @@ def multi_retrieval_agent(queries: list[str], k=3):
     all_docs = set()
 
     for q in queries:
-        docs = retrieval_agent(q, k)
+        docs = hybrid_retrieval_agent(q, k)
         all_docs.update(docs)
 
     logger.info(f"[Multi-Retrieval] Unique docs: {len(all_docs)}")
@@ -334,7 +397,7 @@ def ask(req: AskRequest):
 
     logger.info(f"[ASK] Query: {req.query}")
 
-    docs = retrieval_agent(req.query, k=10)
+    docs = hybrid_retrieval_agent(req.query, k=10)
 
     if not validation_agent(docs):
         logger.warning("[ASK] No docs → Multi-query triggered")
